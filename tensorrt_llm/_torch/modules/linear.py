@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
 
@@ -155,8 +156,9 @@ class Linear(nn.Module):
         quant_config: Optional[QuantConfig] = None,
         weights_loading_config: Optional[WeightsLoadingConfig] = None,
         reduce_output: bool = True,  # ROW parallel only
-        skip_create_weights: bool = False,
+        skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        lora: Optional[LoraLayer] = None,
     ):
         from ..distributed import AllReduce
 
@@ -197,8 +199,9 @@ class Linear(nn.Module):
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        self.lora = lora
 
-        if not skip_create_weights:
+        if not skip_create_weights_in_init:
             self.create_weights()
 
     def create_weights(self):
@@ -210,9 +213,9 @@ class Linear(nn.Module):
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
         self.has_nvfp4 = False
-        # only _create_weights, and load quantized weight directly.
+
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
-        ):
+                exclude_kv_cache=True):
             self.has_any_quant = True
             qc = self.quant_config
             if qc.layer_quant_mode.has_fp8_qdq():
@@ -310,7 +313,12 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
-    def apply_linear(self, input, weight, bias):
+    def apply_linear(self,
+                     input,
+                     weight,
+                     bias,
+                     lora_params: Optional[dict] | None = None,
+                     layer_idx: Optional[int] | None = None):
         if self.has_any_quant:
             qc = self.quant_config
             if self.has_fp8_qdq:
@@ -368,6 +376,12 @@ class Linear(nn.Module):
                                                     out_dtype=None)
             else:
                 output = F.linear(input, self.weight, bias)
+
+        if self.lora is not None and bool(lora_params):
+            lora_result = self.lora(input, lora_params, layer_idx)
+            if lora_result is not None:
+                output = output + lora_result
+
         return output
 
     def _maybe_fuse_bias_into_allreduce(
@@ -392,6 +406,8 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+        layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         from ..distributed import allgather
 
@@ -401,19 +417,23 @@ class Linear(nn.Module):
                 fuse_bias = self._maybe_fuse_bias_into_allreduce(
                     bias, all_reduce_params)
                 bias = None if fuse_bias else bias
-                output = self.apply_linear(input, self.weight, bias)
+                output = self.apply_linear(input, self.weight, bias,
+                                           lora_params, layer_idx)
                 output = self.all_reduce(
                     output,
                     all_reduce_params=all_reduce_params,
                 )
             else:
-                output = self.apply_linear(input, self.weight, bias)
+                output = self.apply_linear(input, self.weight, bias,
+                                           lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            output = self.apply_linear(input, self.weight, self.bias)
+            output = self.apply_linear(input, self.weight, self.bias,
+                                       lora_params, layer_idx)
             if self.gather_output:
                 output = allgather(output, self.mapping)
         else:
-            output = self.apply_linear(input, self.weight, self.bias)
+            output = self.apply_linear(input, self.weight, self.bias,
+                                       lora_params, layer_idx)
 
         return output
 
@@ -421,6 +441,9 @@ class Linear(nn.Module):
         assert self._weights_created
 
         def _copy(dst: Parameter, src: torch.Tensor):
+            # TODO check that is it a reasonable change or not
+            if dst.dtype != src.dtype:
+                src = src.to(dst.dtype)
             assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
             dst.data.copy_(src)
 

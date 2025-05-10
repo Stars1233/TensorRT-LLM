@@ -15,7 +15,6 @@
 # -*- coding: utf-8 -*-
 
 import datetime
-import json
 import os
 import re
 import shutil
@@ -30,6 +29,7 @@ from typing import Iterable, Sequence
 import defs.ci_profiler
 import psutil
 import pytest
+import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
@@ -54,9 +54,6 @@ except ImportError:
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
-EVALTOOL_REPO_URL = os.environ.get("EVALTOOL_REPO_URL")
-LLM_GATE_WAY_CLIENT_ID = os.environ.get("LLM_GATE_WAY_CLIENT_ID")
-LLM_GATE_WAY_TOKEN = os.environ.get("LLM_GATE_WAY_TOKEN")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -1668,79 +1665,6 @@ def llm_aya_23_35b_model_root(llm_venv):
     return model_root
 
 
-def evaltool_mmlu_post_process(results_path, baseline, threshold):
-    # Note: In the older version of the lm-harness result file,
-    # there are 57 values.
-    # The latest version of lm-harness includes
-    # 4 additional categories and 1 whole dataset in the result file.
-    # We need to exclude these new categories and
-    # the whole dataset when calculating the average.
-
-    with open(results_path) as f:
-        result = json.load(f)
-        acc_acc = 0.0
-        tasks_to_ignore = [
-            "mmlu_str", "mmlu_str_stem", "mmlu_str_other",
-            "mmlu_str_social_sciences", "mmlu_str_humanities"
-        ]
-        total_task = len(result['results']) - len(tasks_to_ignore)
-        assert total_task == 57
-        for sub_task in result['results']:
-            if sub_task in tasks_to_ignore:
-                continue
-            acc_acc += float(result['results'][sub_task]['exact_match,none'])
-        avg_acc = acc_acc / total_task
-        print("MMLU avg accuracy:", avg_acc)
-        assert abs(avg_acc - baseline) <= threshold
-
-
-def evaltool_wikilingua_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        result = json.load(f)
-        rouge_l = result['results']['wikilingua_english']['rougeL,none']
-        print("Wikilingua_english rouge_L:", rouge_l)
-        assert abs(rouge_l - baseline) <= threshold
-
-
-def evaltool_humaneval_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        result = json.load(f)
-        print(result)
-        acc = result[0]['humaneval']['pass@1']
-        assert abs(acc - baseline) <= threshold
-
-
-def evaltool_mtbench_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        get_result = False
-        for total_score in f:
-            if total_score.startswith('total'):
-                get_result = True
-                total_score = float(total_score.split(',')[1].strip())
-                assert abs(total_score - baseline) <= threshold
-        assert get_result
-
-
-@pytest.fixture(scope="module")
-def evaltool_root(llm_venv):
-    if GITLAB_API_USER is None or GITLAB_API_TOKEN is None or EVALTOOL_REPO_URL is None:
-        pytest.skip(
-            "Need to set GITLAB_API_USER, GITLAB_API_TOKEN, and EVALTOOL_REPO_URL env vars to run evaltool tests."
-        )
-    workspace = llm_venv.get_working_directory()
-    clone_dir = os.path.join(workspace, "eval-tool")
-    repo_url = f"https://{GITLAB_API_USER}:{GITLAB_API_TOKEN}@{EVALTOOL_REPO_URL}"
-    branch_name = "dev/0.9"
-
-    from evaltool.constants import EVALTOOL_SETUP_SCRIPT
-    evaltool_setup_cmd = [
-        EVALTOOL_SETUP_SCRIPT, "-b", branch_name, "-d", clone_dir, "-r",
-        repo_url
-    ]
-    call(" ".join(evaltool_setup_cmd), shell=True)
-    return clone_dir
-
-
 @pytest.fixture(scope="function")
 def engine_dir(llm_venv, capfd):
     "Get engine dir"
@@ -1888,19 +1812,8 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join([
-            "nvidia-smi" + suffix, "--query-gpu=compute_cap",
-            "--format=csv,noheader"
-        ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-
-    compute_cap = output.strip().split("\n")[0]
-    sm_major, sm_minor = list(map(int, compute_cap.split(".")))
-
-    return sm_major * 10 + sm_minor
+    prop = torch.cuda.get_device_properties(0)
+    return prop.major * 10 + prop.minor
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1912,7 +1825,7 @@ skip_pre_hopper = pytest.mark.skipif(
     reason="This test is not supported in pre-Hopper architecture")
 
 skip_pre_blackwell = pytest.mark.skipif(
-    get_sm_version() < 100,
+    get_sm_version() < 100 or get_sm_version() >= 120,
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
@@ -1921,6 +1834,9 @@ skip_post_blackwell = pytest.mark.skipif(
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
+skip_no_hopper = pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="This test is only  supported in Hopper architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1976,22 +1892,6 @@ def get_device_memory():
         memory = int(output.strip().split()[0])
 
     return memory
-
-
-#
-# When test parameters have an empty id, older versions of pytest ignored that parameter when generating the
-# test node's ID completely. This however was actually a bug, and not expected behavior that got fixed in newer
-# versions of pytest:https://github.com/pytest-dev/pytest/pull/6607. TRT test defs however rely on this behavior
-# for quite a few test names. This is a hacky WAR that restores the old behavior back so that the
-# test names do not change. Note: This might break in a future pytest version.
-#
-# TODO: Remove this hack once the test names are fixed.
-#
-
-from _pytest.python import CallSpec2
-
-CallSpec2.id = property(
-    lambda self: "-".join(map(str, filter(None, self._idlist))))
 
 
 def pytest_addoption(parser):

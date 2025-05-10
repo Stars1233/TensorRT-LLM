@@ -22,6 +22,7 @@ from defs.conftest import skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
@@ -298,6 +299,7 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
                           llm_rouge_root=llm_rouge_root)
 
 
+@skip_pre_ada
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],

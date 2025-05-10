@@ -30,6 +30,7 @@ KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEve
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
+WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -57,30 +58,6 @@ class BaseResourceManager(ABC):
 
     def shutdown(self):
         pass
-
-
-class DummyKvCacheManager(BaseResourceManager):
-
-    def __init__(self,
-                 block_count: int,
-                 max_num_tokens: int,
-                 block_size: int = 64):
-        super(BaseResourceManager, self).__init__()
-        self.block_count = block_count
-        self.max_num_tokens = max_num_tokens
-        self.block_size = block_size
-
-    def get_max_resource_count(self) -> int:
-        return self.block_count
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        max_new_tokens = request.max_new_tokens if request.max_new_tokens is not None else self.max_num_tokens - request.orig_prompt_len
-        context_token_count = request.orig_prompt_len
-        num_context_blocks = context_token_count // self.block_size
-        remaining_tokens = context_token_count + max_new_tokens - num_context_blocks * self.block_size
-        need_blocks = num_context_blocks + math.ceil(
-            remaining_tokens / self.block_size)
-        return need_blocks
 
 
 class KVCacheManager(BaseResourceManager):
@@ -295,6 +272,12 @@ class KVCacheManager(BaseResourceManager):
     def add_dummy_requests(
         self,
         request_ids: List[int],
+        # Note that token_nums should be past_kv_len + input_len (without
+        # spec decoding). The draft tokens will be added in this function,
+        # so we don't need to take care of it in the caller. When preparing
+        # token_nums, we should not take the draft tokens into account, so
+        # don't use the kv_cache_manager.max_seq_len, which includes both
+        # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
         prepare_resource: bool = True,
@@ -304,8 +287,7 @@ class KVCacheManager(BaseResourceManager):
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[
-                i] if token_nums is not None else 1 + max_num_draft_tokens
+            token_num = token_nums[i] if token_nums is not None else 1
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -320,12 +302,17 @@ class KVCacheManager(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
+                for _ in range(self.num_extra_kv_tokens):
+                    self.impl.add_token(req_id)
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1 + max_num_draft_tokens
+                req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
-                    req.py_draft_tokens = [0] * max_num_draft_tokens
+                    req.py_draft_tokens = [1] * max_num_draft_tokens
+                    if prepare_resource:
+                        for _ in range(max_num_draft_tokens):
+                            self.impl.add_token(req_id)
             requests.append(req)
         return requests
 
@@ -431,6 +418,10 @@ class KVCacheManager(BaseResourceManager):
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
+
+    def get_num_available_tokens(self, max_num_draft_tokens: int = 0) -> int:
+        return (self.get_num_free_blocks() * self.tokens_per_block -
+                self.num_extra_kv_tokens - max_num_draft_tokens)
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         result = self.impl.get_primary_pool_data(layer_idx)
@@ -694,9 +685,9 @@ class SlotManager:
         return slot
 
     def remove_slot(self, request_id: int):
-        assert request_id in self.slot_mapping
-        slot = self.slot_mapping.pop(request_id)
-        self.free_slots.add(slot)
+        if request_id in self.slot_mapping:
+            slot = self.slot_mapping.pop(request_id)
+            self.free_slots.add(slot)
 
 
 class ResourceManager:
@@ -739,8 +730,10 @@ class ResourceManager:
 
 class PeftCacheManager(BaseResourceManager):
 
-    def __init__(self, peft_cache_config: PeftCacheConfig,
-                 model_config: ModelConfig):
+    def __init__(self,
+                 peft_cache_config: PeftCacheConfig,
+                 model_config: ModelConfig,
+                 world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
@@ -759,22 +752,18 @@ class PeftCacheManager(BaseResourceManager):
             lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
         )
 
-        # TODO smor- currently set manually, change that
-        world_config = _tb.WorldConfig()
+        if world_config is None:
+            world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
-        CudaStream = tensorrt_llm.bindings.internal.runtime.CudaStream
-        self._stream = torch.cuda.Stream().cuda_stream  # FIXME
-        cuda_stream = CudaStream(self._stream)
-        buffer_manager = BufferManager(cuda_stream, True)
+        buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
+                                       True)
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
 
     def add_request_peft(self, request: LlmRequest):
-        # TODO smor- a helper function to add a request to the peft cache manager.
-        # Cosnider replacing in favor of prepare_resources
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
@@ -800,8 +789,6 @@ class PeftCacheManager(BaseResourceManager):
                 req.lora_config = req.lora_config.reshape(
                     [1] + list(req.lora_config.shape))
             self.impl.add_request_peft(req, True)
-            import time
-            time.sleep(0.1)  # FIXME
 
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
             context_batch, generation_batch, False)

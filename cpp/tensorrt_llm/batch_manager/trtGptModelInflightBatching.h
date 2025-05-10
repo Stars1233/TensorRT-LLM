@@ -82,6 +82,7 @@ class GenerateRequestOptions;
 class LogitsPostProcessor;
 class MakeDecodingBatchInputOutput;
 class CreateNewDecoderRequests;
+class UpdateDecoderBuffers;
 
 namespace utils
 {
@@ -137,6 +138,12 @@ public:
     ~TrtGptModelInflightBatching() override;
 
     void terminateRequest(LlmRequestPtr const& llmRequest, bool pause = false) override;
+
+    /// @brief Terminate request in the next forwardSync call that includes the request.
+    /// @details This function does not terminate requests immediately. It will add the requests to the
+    ///          mReqIdsToTerminate set. The requests will be terminated in the next forwardSync call that
+    ///          includes the request in the batch.
+    void terminateRequestSync(LlmRequestPtr const& llmRequest, executor::FinishReason finishReason) override;
 
     /// @brief Function that waits for the decoding of requests in flight.
     ///        When the requests have finished or using speculative decoding, the state of requests
@@ -295,7 +302,6 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -534,6 +540,8 @@ private:
     std::vector<ScheduledRequests> mMicroBatchScheduledRequests;
     // Set of in-flight requests of *all* micro batches
     ReqIdsSet mInflightReqIds;
+    // Requests that should be terminated (requested from outside the model)
+    std::unordered_map<RequestIdType, executor::FinishReason> mReqIdsToTerminate;
     // Requests that the scheduler selected to be paused
     ReqIdsSet mReqIdsToPause;
     // Stats collected in last iteration
@@ -574,6 +582,7 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;
+    std::unique_ptr<tensorrt_llm::batch_manager::UpdateDecoderBuffers const> mUpdateDecoderBuffers;
 };
 
 } // namespace tensorrt_llm::batch_manager

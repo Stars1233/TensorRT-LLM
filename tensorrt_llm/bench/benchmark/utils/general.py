@@ -97,6 +97,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
         "ep_size": params.get("ep"),
+        "cluster_size": params.get("cluster_size"),
     }
 
     if params.get("max_batch_size") and params.get("max_num_tokens"):
@@ -134,8 +135,10 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
     pyt_options = {
         "use_cuda_graph": True,
+        "cuda_graph_padding_enabled": True,
         "enable_overlap_scheduler": True,
         "kv_cache_dtype": kv_cache_dtype,
+        "cuda_graph_max_batch_size": max_batch_size,
     }
     backend = params.get("backend", "pytorch")
 

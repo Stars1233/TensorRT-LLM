@@ -22,7 +22,9 @@ class ModelConfig(Generic[TConfig]):
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
-    skip_create_weights: bool = False
+    # Delay weights creation to DecoderModelForCausalLM.__post_init__
+    # to support mixed quantization.
+    skip_create_weights_in_init: bool = False
     is_generation: bool = True
     max_num_tokens: int = 8192
     moe_max_num_tokens: Optional[int] = None
@@ -95,28 +97,42 @@ class ModelConfig(Generic[TConfig]):
 
             json_quant_configs = quant_config_dict['quantization']
 
-            def _load_json_quant_config(key: str):
-                if key in json_quant_configs:
-                    return json_quant_configs[key]
-                return None
-
-            quant_config.quant_algo = _load_json_quant_config('quant_algo')
-            quant_config.kv_cache_quant_algo = _load_json_quant_config(
-                'kv_cache_quant_algo')
-            quant_config.group_size = _load_json_quant_config('group_size')
-            quant_config.exclude_modules = _load_json_quant_config(
-                'exclude_modules')
+            quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
+            quant_config.kv_cache_quant_algo = json_quant_configs.get(
+                'kv_cache_quant_algo', None)
+            quant_config.group_size = json_quant_configs.get('group_size', None)
+            quant_config.exclude_modules = json_quant_configs.get(
+                'exclude_modules', None)
 
             if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
                 mixed_quant_config_file = model_dir / 'quant_cfg.json'
                 with open(mixed_quant_config_file) as fm:
-                    mixed_quant_config = json.load(fm)
-                    mixed_quant_config = mixed_quant_config['quantized_layers']
-                    for k in mixed_quant_config:
+                    mixed_quant_configs = json.load(fm)
+                    # kv_cache_quant_algo is global regardless of MIXED_PRECISION
+                    kv_cache_quant_algo = mixed_quant_configs[
+                        'kv_cache_quant_algo']
+                    mixed_quant_configs = mixed_quant_configs[
+                        'quantized_layers']
+                    if kv_cache_quant_algo is not None and quant_config.kv_cache_quant_algo is not None:
+                        if kv_cache_quant_algo != quant_config.kv_cache_quant_algo:
+                            raise RuntimeError(
+                                f"The kvcache config in 'quant_cfg.json', {kv_cache_quant_algo},"
+                                f"is different from 'hf_quant_config.json', {quant_config.kv_cache_quant_algo}!"
+                            )
+                    kv_cache_quant_algo = kv_cache_quant_algo or quant_config.kv_cache_quant_algo
+
+                    for layer in mixed_quant_configs:
                         config = QuantConfig()
-                        config.quant_algo = mixed_quant_config[k]['quant_algo']
-                        mixed_quant_config[k] = config
-                layer_quant_config = mixed_quant_config
+                        config.kv_cache_quant_algo = kv_cache_quant_algo
+                        config.quant_algo = mixed_quant_configs[layer][
+                            'quant_algo']
+                        config.group_size = mixed_quant_configs[layer].get(
+                            'group_size', None)
+                        mixed_quant_configs[layer] = config
+                layer_quant_config = mixed_quant_configs
+            elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                if quant_config.group_size is None:
+                    quant_config.group_size = 128
 
             if kwargs.get(
                     'moe_backend'
@@ -152,22 +168,18 @@ class ModelConfig(Generic[TConfig]):
                    quant_config_dict=layer_quant_config,
                    **kwargs)
 
-    def get_bindings_model_config(
-            self,
-            tensor_parallelism: int = 1,
-            context_parallelism: int = 1) -> "ModelConfigCpp":
+    def get_bindings_model_config(self) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
-        # TODO smor- currently parallelism is not supported, set default to 1
         # TODO smor- currently assuming no rnn layers, no MOE
         from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 
         num_heads = self.pretrained_config.num_attention_heads // (
-            tensor_parallelism * context_parallelism)
+            self.mapping.tp_size * self.mapping.cp_size)
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -179,7 +191,7 @@ class ModelConfig(Generic[TConfig]):
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
-        mlp_hidden_size = self.pretrained_config.intermediate_size // tensor_parallelism
+        mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:
