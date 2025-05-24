@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -7,6 +7,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..utils import (get_last_power_of_2_num_tokens_buckets,
+                     get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
 
@@ -275,6 +276,24 @@ class NVFP4GemmRunner(TunableRunner):
             tactic,
         )
 
+    def find_nearest_profile(
+            self, shapes: Tuple[torch.Size],
+            dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
+                                                               Callable],
+                                                         Callable]]],
+            constraints: Tuple[Tuple[int, int, Callable]]) -> Tuple:
+        """Generate a unique profile to reduce host overhead during inference.
+        """
+        _, _, (_, shape_round_rule) = dynamic_tensors[0]
+        m, n, k = shape_round_rule(shapes[0][0]), shapes[1][0], shapes[1][1] * 2
+
+        return (m, n, k)
+
+    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+        """Generate a unique cache key for the given profile.
+        """
+        return (self.sf_use_ue8m0, self.output_dtype), profile
+
 
 def fp4_scale_dims(input_shapes: List[torch.Tensor], sf_vec_size: int = 16):
     """Calculate the dimensions of the fp4 scale tensor.
@@ -301,8 +320,11 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (get_last_power_of_2_num_tokens_buckets,
-                                 last_positive_power_of_2)), ),
+        dynamic_tensors=((0, 0, (
+            lambda x: get_power_of_2_num_tokens_buckets(8192)
+            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
+                x), lambda x: next_positive_power_of_2(x)
+            if not to_userbuffers else last_positive_power_of_2(x))), ),
         constraints=((2, 0, fp4_scale_dims), ),
     )
 
@@ -399,6 +421,7 @@ def attention(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
+    attention_chunk_size: Optional[int],
 ) -> torch.Tensor:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -428,7 +451,8 @@ def attention(
         use_paged_context_fmha, attention_input_type, is_mla_enable,
         q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets)
+        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
+        attention_chunk_size)
     return output
 
 
@@ -494,6 +518,7 @@ def _(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
+    attention_chunk_size: Optional[int],
 ) -> torch.Tensor:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)

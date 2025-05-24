@@ -191,43 +191,6 @@ def generate_fmha_cu(project_dir, venv_python):
     os.chdir(project_dir)
 
 
-def apply_torch_nvtx3_workaround(venv_python: Path):
-    """Workaround for nvtx3 path detection in PyTorch's CMake files."""
-    try:
-        # Get site-packages directory
-        result = check_output(
-            f'"{venv_python}" -c "import site; print(site.getsitepackages()[0])"',
-            shell=True,
-            text=True)
-        site_packages = Path(result.strip())
-        torch_dir = site_packages / "torch"
-
-        if not torch_dir.exists():
-            print(f"Not found torch installation for patching NVTX3 workaround")
-            return
-
-        # Define patterns and their corresponding messages
-        replacement_patterns = [
-            ("find_path(nvtx3_dir NAMES nvtx3)",
-             "Applying NVTX3 workaround to {cmake_file}"),
-            ('find_path(nvtx3_dir NAMES nvtx3 PATHS "${PROJECT_SOURCE_DIR}/third_party/NVTX/c/include" NO_DEFAULT_PATH)',
-             "Applying additional NVTX3 workaround to {cmake_file}")
-        ]
-
-        replacement = "find_path(nvtx3_dir NAMES nvtx3 PATHS ${CUDA_INCLUDE_DIRS})"
-
-        for search_pattern, message_template in replacement_patterns:
-            for cmake_file in torch_dir.rglob("*.cmake"):
-                content = cmake_file.read_text()
-                if search_pattern in content:
-                    print(message_template.format(cmake_file=cmake_file))
-                    new_content = content.replace(search_pattern, replacement)
-                    cmake_file.write_text(new_content)
-
-    except Exception as e:
-        print(f"Failed to apply NVTX3 workaround: {e}")
-
-
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -239,6 +202,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         nixl_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -278,11 +242,6 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename)
-
-    # Workaround for torch nvtx3 find_path not work issue with CUDA 12.9.
-    # See https://github.com/pytorch/pytorch/pull/147418.
-    apply_torch_nvtx3_workaround(Path(sys.executable))
-    apply_torch_nvtx3_workaround(venv_python)
 
     # Ensure base TRT is installed (check inside the venv)
     reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
@@ -339,6 +298,9 @@ def main(*,
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
+
+    if nixl_root is not None:
+        cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
@@ -525,6 +487,14 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
+                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -680,6 +650,8 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument("--nixl_root",
+                        help="Directory to find NIXL headers/libs")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",

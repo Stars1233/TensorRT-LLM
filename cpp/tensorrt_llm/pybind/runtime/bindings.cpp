@@ -16,8 +16,10 @@
  */
 
 #include "bindings.h"
+#include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
+#include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -33,6 +35,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
@@ -46,8 +49,6 @@
 #include <torch/extension.h>
 
 namespace tr = tensorrt_llm::runtime;
-namespace tle = tensorrt_llm::executor;
-using CudaStreamPtr = std::shared_ptr<tr::CudaStream>;
 
 class PyITensor : public tensorrt_llm::runtime::ITensor
 {
@@ -366,7 +367,10 @@ void initBindings(pybind11::module_& m)
             py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
-        .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
+        .def_property_readonly(
+            "decoder_stream",
+            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
+            py::return_value_policy::reference)
         .def_property_readonly(
             "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
 
@@ -393,6 +397,15 @@ void initBindings(pybind11::module_& m)
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
+    m.def(
+        "max_workspace_size_lowprecision",
+        [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
+        "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
+        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
+        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
+        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
@@ -413,6 +426,9 @@ void initBindings(pybind11::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // Initialize MoeLoadBalancer bindings
+    initMoeBindings(m);
 }
 
 } // namespace tensorrt_llm::pybind::runtime
