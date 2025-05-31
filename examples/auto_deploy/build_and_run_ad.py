@@ -39,14 +39,17 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
 
     # setup AD config
     ad_config = AutoDeployConfig(
-        use_cuda_graph=config.compile_backend == "torch-opt",
-        torch_compile_enabled=config.compile_backend == "torch-opt",
+        # Both torch-opt and torch-cudagraph invoke cudagraphs
+        use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
+        # Both torch-opt and torch-compile invoke torch.compile
+        torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
         model_factory=config.model_factory,
         model_kwargs=config.model_kwargs,
         attn_backend=config.attn_backend,
         mla_backend=config.mla_backend,
         skip_loading_weights=config.skip_loading_weights,
         cuda_graph_max_batch_size=config.max_batch_size,
+        free_mem_ratio=config.free_mem_ratio,
     )
     ad_logger.info(f"AutoDeploy Config: {ad_config}")
 
@@ -70,7 +73,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         model=factory.model,
         backend="autodeploy",
         build_config=build_config,
-        pytorch_backend_config=ad_config,
+        auto_deploy_config=ad_config,
         tensor_parallel_size=config.world_size,
         tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
     )
@@ -93,6 +96,7 @@ def main(config: Optional[SimpleConfig] = None):
     llm = build_llm_from_config(config)
 
     # prompt the model and print its output
+    ad_logger.info("Running example prompts...")
     outs = llm.generate(
         config.prompt,
         sampling_params=SamplingParams(
@@ -104,7 +108,8 @@ def main(config: Optional[SimpleConfig] = None):
     print_outputs(outs)
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
-    if config.benchmark:
+    if config.benchmark and config.runtime != "trtllm":
+        ad_logger.info("Running benchmark...")
         keys = [
             "compile_backend",
             "attn_backend",
@@ -117,13 +122,19 @@ def main(config: Optional[SimpleConfig] = None):
         benchmark(
             func=lambda: llm.generate(
                 torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist(),
-                sampling_params=SamplingParams(max_tokens=config.benchmark_osl, top_k=None),
+                sampling_params=SamplingParams(
+                    max_tokens=config.benchmark_osl,
+                    top_k=None,
+                    ignore_eos=True,
+                ),
                 use_tqdm=False,
             ),
             num_runs=config.benchmark_num,
             log_prefix="Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
             results_path=config.benchmark_results_path,
         )
+    elif config.benchmark:
+        ad_logger.info("Skipping simple benchmarking for trtllm...")
     llm.shutdown()
 
 

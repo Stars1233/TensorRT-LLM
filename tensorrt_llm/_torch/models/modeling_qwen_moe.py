@@ -19,7 +19,8 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class QwenMoE(nn.Module):
@@ -82,14 +83,12 @@ class QwenMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False)
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = F.sigmoid(
@@ -257,14 +256,6 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
         head_dim = self.config.hidden_size // self.config.num_attention_heads
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

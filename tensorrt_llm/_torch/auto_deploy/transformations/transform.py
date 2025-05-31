@@ -11,28 +11,30 @@ from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
 from ..utils.logger import ad_logger
-from ._graph import canonicalize_graph, move_to_device
+from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
-    check_in_out_nodes,
     column_row_shard,
+    dp_bmm_shard,
     eliminate_redundant_transposes,
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
-    fuse_gemms,
     fuse_moe,
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
+    match_complex_rope,
     match_eager_attention,
+    match_explicit_rope,
     match_grouped_attention,
     match_moe_pattern,
     match_repeat_kv,
-    match_rope_v1,
-    match_rope_v2,
+    match_rope_layout,
+    optimize_rope,
     quantize,
     resize_kv_cache,
+    update_in_out_nodes,
 )
 
 
@@ -47,11 +49,15 @@ class InferenceOptimizer:
         self.factory = factory
         self.attn_backend = ad_config.attn_backend
         self.mla_backend = ad_config.mla_backend
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
+
         self.ad_config = ad_config
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
+        # Map Pytorch config to AutoDeploy compile backends.
+        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
             compile_backend = "torch-opt"
+        elif ad_config.use_cuda_graph:
+            compile_backend = "torch-cudagraph"
+        elif ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
         else:
             compile_backend = "torch-simple"
         self.compile_backend = compile_backend
@@ -84,10 +90,8 @@ class InferenceOptimizer:
         # EXPORT MODEL TO GRAPH MODULE
         ############################################################################################
 
-        cm.info._set_example_sequence()
-        egm = torch_export_to_gm(
-            model, args=cm.args_original, dynamic_shapes=cm.original_dynamic_shapes
-        )
+        cm.info.set_example_sequence()
+        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -118,10 +122,10 @@ class InferenceOptimizer:
         egm = match_attention_layout(egm, self.attention_op)
 
         # Match rope
-        # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
-        egm = match_rope_v1(egm)
-        egm = match_rope_v2(egm)
+        egm = match_explicit_rope(egm)
+        egm = match_complex_rope(egm)
+        # Match RoPE layout expected by our backend
+        egm = match_rope_layout(egm, self.attention_op.get_attention_layout())
 
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
@@ -130,22 +134,30 @@ class InferenceOptimizer:
         # eliminate redundant transpose operations
         egm = eliminate_redundant_transposes(egm)
 
+        # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
+        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+        egm = optimize_rope(egm)
+
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
 
+        # run BMM sharding across ranks
+        egm = dp_bmm_shard(egm, local_rank, world_size)
+
         # let's run a shape propagation pass to update the graph with correct meta values for
-        # subsequent optimization passes
-        egm = canonicalize_graph(egm, shape_prop=True)
+        # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check
+        with lift_to_meta(egm):
+            egm = canonicalize_graph(egm, shape_prop=True)
 
         ############################################################################################
         # MOVE MODEL AND LOAD WEIGHTS
         ############################################################################################
 
         # load weights
-        self.factory.load_or_random_init(egm, mmap=True, map_location=cm.device)
+        self.factory.load_or_random_init(egm, device=cm.device)
 
         # move remaining parts to device
         move_to_device(egm, cm.device)
@@ -159,7 +171,8 @@ class InferenceOptimizer:
         egm = fuse_moe(egm)
 
         # run GEMM fusion
-        egm = fuse_gemms(egm)
+        # TODO: this is causing OOMs, so we're disabling it for now
+        # egm = fuse_gemms(egm)
 
         # check if we can fuse allreduce, residual and rmsnorm
         egm = fuse_allreduce_residual_rmsnorm(egm)
@@ -181,29 +194,26 @@ class InferenceOptimizer:
                 pass
 
         ############################################################################################
-        # HANDLE CACHES
+        # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
         ############################################################################################
 
-        input_nodes = check_in_out_nodes(egm)
+        egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
         for attn_descriptor in [self.attention_op, self.mla_op]:
-            egm = insert_cached_attention(
-                egm, cm, attn_descriptor, self.factory.get_cache_config(), input_nodes
-            )
+            egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device
         cm.initialize_caches()
 
-        # Free memory ratio is hardcoded to 0.8 for now to ensure we have enough memory for graph
-        # capture.
-        resize_kv_cache(egm, cm, free_mem_ratio=0.8)
+        # resize kv cache to occupy the available GPU memory up to free_mem_ratio
+        resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
 
         ############################################################################################
         # COMPILE MODEL
         ############################################################################################
 
-        cm.info._set_generate_only_batch()
+        cm.info.set_generate_only_batch()
         compiler_kwargs = {
             "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
             "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
