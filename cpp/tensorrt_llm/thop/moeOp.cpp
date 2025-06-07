@@ -18,8 +18,6 @@
 #include "moe_kernels.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -373,10 +371,10 @@ public:
         return mAllProfiles.size();
     }
 
-    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc2_expert_weights, int64_t const top_k,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        int64_t const cluster_size, int64_t const cluster_rank, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation)
+    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc1_expert_weights,
+        torch::Tensor const& fc2_expert_weights, int64_t const top_k, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const min_latency_mode, int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -399,6 +397,9 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
+        auto const* expert_weights_ptr
+            = (gemm_idx == 1) ? fc1_expert_weights.const_data_ptr() : fc2_expert_weights.const_data_ptr();
+
         // Preparation phase, only enabled during autotuning warmup phase.
         if (do_preparation)
         {
@@ -413,24 +414,25 @@ public:
 
             bool const USE_BIAS = false;
             bool const USE_LORA = false;
+            auto activation_dtype = mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
+            activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
-                tensorrt_llm::runtime::TorchUtils::dataType(
-                    mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype),
+                tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, inter_size, group_size, tensorrt_llm::ActivationType::Swiglu, USE_BIAS, USE_LORA,
-                min_latency_mode, parallelism_config);
+                min_latency_mode, /*need_weights*/ false, parallelism_config);
 
             freeProfileWorkspace();
             size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
             auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
-            mProfiler->prepare(num_rows, mProfileWorkspace, stream);
+            mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, stream);
         }
 
         // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-        mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, stream);
+        mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights_ptr, stream);
     }
 
 private:

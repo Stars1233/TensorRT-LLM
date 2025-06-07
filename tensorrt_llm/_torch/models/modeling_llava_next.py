@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import ModelConfig, register_auto_model
+from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 
 class LlavaNextInputProcessor(InputProcessor):
@@ -192,7 +192,7 @@ class LlavaNextInputProcessor(InputProcessor):
 
 
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(LlavaNextInputProcessor)
+@register_input_processor(LlavaNextInputProcessor, model_type="llava_next")
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 
@@ -224,15 +224,6 @@ class LlavaNextModel(PreTrainedModel):
 
     def load_weights(self, weights):
 
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v.to(self.dtype)
-                    assert result[new_k] is not None
-            return result
-
         weights = filter_weights("language_model", weights)
         self.llm.load_weights(weights)
 
@@ -247,8 +238,8 @@ class LlavaNextModel(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         **kwargs,

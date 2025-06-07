@@ -93,7 +93,7 @@ pythonBoolean2cpp = {True: 'true', False: 'false'}
 class AttentionMaskType(IntEnum):
     PADDING = 0
     CAUSAL = 1
-    SLIDING_WINDOW_CAUSAL = 2
+    SLIDING_OR_CHUNKED_CAUSAL = 2
     CUSTOM_MASK = 3
 
 
@@ -147,7 +147,8 @@ spec_fields = (
     'disabled_mask_types',
     'head_size_v',
     'sage_block_sizes',
-    'output_dtype')
+    'output_dtype',
+    'is_mtp')
 kernel_spec = namedtuple('kernel_spec', spec_fields)
 kernel_spec.__new__.__defaults__ = (
     1,  # ctas_per_head
@@ -171,7 +172,8 @@ kernel_spec.__new__.__defaults__ = (
     None,  # disabled_mask_types
     0,  # head size of V
     None,  # sage_block_sizes
-    None)  # output_dtype, same as dtype by default.
+    None,  # output_dtype, same as dtype by default.
+    False)  # use MTP or not
 
 generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
                                     'False').lower() == 'true'
@@ -187,8 +189,7 @@ namespace kernels
 ns_close = r"""
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
-""" if generate_cu_trtllm else ""
+} // namespace tensorrt_llm""" if generate_cu_trtllm else ""
 
 copyright = '''\
 /***************************************************************************************************
@@ -728,7 +729,7 @@ using Kernel_traits_nl_causal = fmha::{kernel_traits}<
     /*bmm2_fp16_epilogue*/ true,
     {output_dtype_}>;
 
-using Kernel_traits_nl_sliding_window_causal = fmha::{kernel_traits}<
+using Kernel_traits_nl_sliding_or_chunked_causal = fmha::{kernel_traits}<
     fmha::{instruction_traits},
     {kv_loop_step},
     {head_size},
@@ -776,15 +777,15 @@ void {causal_kernel_name}_nl({params_type} params){{
 
 #endif // causal mask
 
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
 
 extern "C"
 __global__
-void {sliding_window_causal_kernel_name}_nl({params_type} params){{
-  fused_multihead_attention::device_{kernel_variant}_nl<Kernel_traits_nl_sliding_window_causal>(params);
+void {sliding_or_chunked_causal_kernel_name}_nl({params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}_nl<Kernel_traits_nl_sliding_or_chunked_causal>(params);
 }}
 
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
 
 #if {custom_mask} // custom_mask
 
@@ -815,15 +816,15 @@ void {launcher_name}_nl(
     }}
     {causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
 #endif // causal mask
-  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL ) {{
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
     if( smem_size >= 48*1024 ) {{
-       FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_window_causal_kernel_name}_nl,
+       FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_or_chunked_causal_kernel_name}_nl,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
     }}
-    {sliding_window_causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
-#endif // sliding_window_causal_mask
+    {sliding_or_chunked_causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#endif // sliding_or_chunked_causal_mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::PADDING ) {{
 #if {padding_mask} // padding_mask
     if( smem_size >= 48*1024 ) {{
@@ -880,7 +881,7 @@ using Kernel_traits_nl_tiled_causal = fmha::{kernel_traits}<
     /*bmm2_fp16_epilogue*/ true,
     {output_dtype_}>;
 
-using Kernel_traits_nl_tiled_sliding_window_causal = fmha::{kernel_traits}<
+using Kernel_traits_nl_tiled_sliding_or_chunked_causal = fmha::{kernel_traits}<
     fmha::{instruction_traits},
     {kv_loop_step},
     {head_size},
@@ -928,15 +929,15 @@ void {causal_kernel_name}_nl_tiled({params_type} params){{
 
 #endif // causal mask
 
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
 
 extern "C"
 __global__
-void {sliding_window_causal_kernel_name}_nl_tiled({params_type} params){{
-  fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_sliding_window_causal>(params);
+void {sliding_or_chunked_causal_kernel_name}_nl_tiled({params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}_nl_tiled<Kernel_traits_nl_tiled_sliding_or_chunked_causal>(params);
 }}
 
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
 
 #if {custom_mask} // custom_mask
 
@@ -968,15 +969,15 @@ void {launcher_name}_nl_tiled(
     }}
     {causal_kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
 #endif // causal mask
-  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL ) {{
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
     if( smem_size >= 48*1024 ) {{
-       FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_window_causal_kernel_name}_nl_tiled,
+       FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_or_chunked_causal_kernel_name}_nl_tiled,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
     }}
-    {sliding_window_causal_kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
-#endif // sliding_window_causal_mask
+    {sliding_or_chunked_causal_kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
+#endif // sliding_or_chunked_causal_mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::PADDING ) {{
 #if {padding_mask} // padding_mask
     if( smem_size >= 48*1024 ) {{
@@ -1076,7 +1077,7 @@ using Kernel_traits_causal = {kernel_traits}<
                               3,
                               {kernel_flags}>;
 
-using Kernel_traits_sliding_window_causal = {kernel_traits}<
+using Kernel_traits_sliding_or_chunked_causal = {kernel_traits}<
                                            Traits_p,
                                            Traits_o,
                                            {seq_len},
@@ -1109,15 +1110,15 @@ void {causal_kernel_name}(const __grid_constant__ {params_type} params){{
 
 #endif // causal mask
 
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
 
 extern "C"
 __global__
-void {sliding_window_causal_kernel_name}(const __grid_constant__ {params_type} params){{
-  fused_multihead_attention::device_{kernel_variant}_tma<Kernel_traits_sliding_window_causal>(params);
+void {sliding_or_chunked_causal_kernel_name}(const __grid_constant__ {params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}_tma<Kernel_traits_sliding_or_chunked_causal>(params);
 }}
 
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
 
 #else
 
@@ -1141,16 +1142,16 @@ void {causal_kernel_name}(const __grid_constant__ {params_type} params){{
 
 #endif // causal mask
 
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
 
 extern "C"
 __global__
-void {sliding_window_causal_kernel_name}(const __grid_constant__ {params_type} params){{
-  fused_multihead_attention::device_{kernel_variant}<Kernel_traits_sliding_window_causal>(params);
+void {sliding_or_chunked_causal_kernel_name}(const __grid_constant__ {params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}<Kernel_traits_sliding_or_chunked_causal>(params);
 }}
 #endif
 
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
 
 void {launcher_name}({fused_multihead_attention_params_v2_str} &params,
     const Launch_params &launch_params, cudaStream_t stream){{
@@ -1254,15 +1255,15 @@ void {launcher_name}({fused_multihead_attention_params_v2_str} &params,
     }}
     {causal_kernel_name}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>({params_str});
 #endif // causal mask
-  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL ) {{
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
     if( smem_size >= 48*1024 ) {{
-       FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_window_causal_kernel_name},
+       FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_or_chunked_causal_kernel_name},
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
     }}
-    {sliding_window_causal_kernel_name}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>({params_str});
-#endif // sliding_window_causal_mask
+    {sliding_or_chunked_causal_kernel_name}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>({params_str});
+#endif // sliding_or_chunked_causal_mask
   }} else {{
 #if {padding_mask} // padding_mask
     constexpr int smem_size = Kernel_traits::BYTES_PER_SMEM;
@@ -1301,7 +1302,7 @@ using Kernel_traits_causal_nl = {kernel_traits}<
                                  3,
                                  {kernel_flags}>;
 
-using Kernel_traits_sliding_window_causal_nl = {kernel_traits}<
+using Kernel_traits_sliding_or_chunked_causal_nl = {kernel_traits}<
                                               Traits_p,
                                               Traits_o,
                                               {seq_len},
@@ -1332,15 +1333,15 @@ void {causal_kernel_name}_nl({params_type} params){{
 
 #endif // causal mask
 
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
 
 extern "C"
 __global__
-void {sliding_window_causal_kernel_name}_nl({params_type} params){{
-  fused_multihead_attention::device_{kernel_variant}_nl<Kernel_traits_sliding_window_causal_nl>(params);
+void {sliding_or_chunked_causal_kernel_name}_nl({params_type} params){{
+  fused_multihead_attention::device_{kernel_variant}_nl<Kernel_traits_sliding_or_chunked_causal_nl>(params);
 }}
 
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
 
 void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     const Launch_params& launch_params, cudaStream_t stream){{
@@ -1359,15 +1360,15 @@ void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     }}
     {causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
 #endif // causal mask
-  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL ) {{
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+  }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
     if( smem_size >= 48*1024 ) {{
-        FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_window_causal_kernel_name}_nl,
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_or_chunked_causal_kernel_name}_nl,
                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          smem_size));
     }}
-    {sliding_window_causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
-#endif // sliding_window_causal_mask
+    {sliding_or_chunked_causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#endif // sliding_or_chunked_causal_mask
   }} else {{
 #if {padding_mask} // padding_mask
     if( smem_size >= 48*1024 ) {{
@@ -1429,6 +1430,7 @@ using Ktraits = {kernel_traits_header}
                 {loop_step},
                 {kv_loop_step},
                 {head_size},
+                {head_size_v},
                 {q_tile_buffers},
                 {kv_tile_buffers},
                 NUM_COMPUTE_GROUPS,
@@ -1451,6 +1453,7 @@ using Ktraits_causal = {kernel_traits_header}
                        {loop_step},
                        {kv_loop_step},
                        {head_size},
+                       {head_size_v},
                        {q_tile_buffers},
                        {kv_tile_buffers},
                        NUM_COMPUTE_GROUPS,
@@ -1466,10 +1469,11 @@ using Ktraits_causal = {kernel_traits_header}
                        {return_softmax_stats_flag},
                        {output_dtype_}>;
 
-using Ktraits_sliding_window_causal = {kernel_traits_header}
+using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {loop_step},
                                       {kv_loop_step},
                                       {head_size},
+                                      {head_size_v},
                                       {q_tile_buffers},
                                       {kv_tile_buffers},
                                       NUM_COMPUTE_GROUPS,
@@ -1489,6 +1493,7 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             {loop_step},
                             {kv_loop_step},
                             {head_size},
+                            {head_size_v},
                             {q_tile_buffers},
                             {kv_tile_buffers},
                             NUM_COMPUTE_GROUPS,
@@ -1545,6 +1550,7 @@ void {kernel_name}(
     }} else {{  // math
 
         {setmaxnreg_compute_str}
+
         fmha::ws::Compute<fmha::{instruction_traits}, Ktraits> compute;
         compute.run(warp_group, tidx, shared, params);
     }}
@@ -1603,20 +1609,20 @@ void {causal_kernel_name}(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
 
-using Shared_sliding_window_causal = typename Ktraits_sliding_window_causal::Shared;
+using Shared_sliding_or_chunked_causal = typename Ktraits_sliding_or_chunked_causal::Shared;
 
 extern "C"
-__global__ __launch_bounds__(Ktraits_sliding_window_causal::THREADS, 1)
-void {sliding_window_causal_kernel_name}(
+__global__ __launch_bounds__(Ktraits_sliding_or_chunked_causal::THREADS, 1)
+void {sliding_or_chunked_causal_kernel_name}(
     const __grid_constant__ {params_type} params){{
 
     extern __shared__ char smem_[];
     char *smem_aligned = fmha::align_1024(smem_);
 
-    Shared_sliding_window_causal *shared =
-        reinterpret_cast<Shared_sliding_window_causal *>(&smem_aligned[0]);
+    Shared_sliding_or_chunked_causal *shared =
+        reinterpret_cast<Shared_sliding_or_chunked_causal *>(&smem_aligned[0]);
     shared->init(threadIdx.x == 0);
     __syncthreads();
 
@@ -1630,11 +1636,11 @@ void {sliding_window_causal_kernel_name}(
         uint32_t elect_one = tidx == 0;
 
         // Need all threads involved when the dam group needs to transpose the v tile explicltly.
-        if constexpr ( Ktraits_sliding_window_causal::DMA_GROUP_TRANSPOSE_V ) {{
-            fmha::ws::DMA<Ktraits_sliding_window_causal>::Device dma_device(elect_one);
+        if constexpr ( Ktraits_sliding_or_chunked_causal::DMA_GROUP_TRANSPOSE_V ) {{
+            fmha::ws::DMA<Ktraits_sliding_or_chunked_causal>::Device dma_device(elect_one);
             dma_device.{run_fct_name}(params, shared);
         }} else {{
-            fmha::ws::DMA<Ktraits_sliding_window_causal>::Device dma_device(elect_one);
+            fmha::ws::DMA<Ktraits_sliding_or_chunked_causal>::Device dma_device(elect_one);
             if( tidx < 32 ) {{
                 dma_device.{run_fct_name}(params, shared);
             }}
@@ -1644,12 +1650,12 @@ void {sliding_window_causal_kernel_name}(
 
         {setmaxnreg_compute_str}
 
-        fmha::ws::Compute<fmha::{instruction_traits}, Ktraits_sliding_window_causal> compute;
+        fmha::ws::Compute<fmha::{instruction_traits}, Ktraits_sliding_or_chunked_causal> compute;
         compute.run(warp_group, tidx, shared, params);
     }}
 }}
 
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1770,15 +1776,15 @@ void {launcher_name}(
         {causal_kernel_name}
             <<<block_size, Ktraits::THREADS, SMEM_BYTES, stream>>>({params_str});
 #endif // causal mask
-    }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL ) {{
-#if {sliding_window_causal_mask} // sliding_window_causal_mask
-        FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_window_causal_kernel_name},
+    }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
+#if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({sliding_or_chunked_causal_kernel_name},
                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          SMEM_BYTES));
 
-        {sliding_window_causal_kernel_name}
+        {sliding_or_chunked_causal_kernel_name}
             <<<block_size, Ktraits::THREADS, SMEM_BYTES, stream>>>({params_str});
-#endif // sliding_window_causal_mask
+#endif // sliding_or_chunked_causal_mask
     }} else if( launch_params.attention_mask_type == Attention_mask_type::CUSTOM_MASK ) {{
 #if {custom_mask} // custom_mask
         FMHA_CHECK_CUDA(cudaFuncSetAttribute({custom_mask_kernel_name},
@@ -1951,24 +1957,24 @@ def selected_mask_types(kspec):
     # '1' means true, '0' means false.
     padding_mask = '1'
     causal_mask = '1'
-    sliding_window_causal_mask = '1'
+    sliding_or_chunked_causal_mask = '1'
     custom_mask = '1'
     # only generate certain needed combinations of input_layout and mask types for trt-llm.
     if "GENERATE_CUBIN" in os.environ:
         if kspec.sage_block_sizes:
             # SageAttention only needs padding mask now
             causal_mask = '0'
-            sliding_window_causal_mask = '0'
+            sliding_or_chunked_causal_mask = '0'
             custom_mask = '0'
         elif (kspec.head_size, kspec.head_size_v) == (192, 128):
             # MLA context phase only needs causal mask now
             padding_mask = '0'
-            sliding_window_causal_mask = '0'
+            sliding_or_chunked_causal_mask = '0'
             custom_mask = '0'
         elif (kspec.head_size, kspec.head_size_v) == (576, 512):
-            # MLA generation phase only needs padding mask now
+            # MLA generation phase only needs padding mask (MtpMask) now
             causal_mask = '0'
-            sliding_window_causal_mask = '0'
+            sliding_or_chunked_causal_mask = '0'
             custom_mask = '0'
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
@@ -1978,7 +1984,7 @@ def selected_mask_types(kspec):
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
             causal_mask = '0'
-            sliding_window_causal_mask = '0'
+            sliding_or_chunked_causal_mask = '0'
             if kspec.head_size not in [32, 64, 72, 128]:
                 padding_mask = '0'
                 custom_mask = '0'
@@ -1991,15 +1997,15 @@ def selected_mask_types(kspec):
         # alibi specialized kernels only need causal mask.
         if (kspec.alibi and kspec.warp_specialization):
             padding_mask = '0'
-            sliding_window_causal_mask = '0'
+            sliding_or_chunked_causal_mask = '0'
             custom_mask = '0'
 
-        # enable_attn_logit_softcapping kernels only need causal mask or sliding_window_causal_mask.
+        # enable_attn_logit_softcapping kernels only need causal mask or sliding_or_chunked_causal_mask.
         if kspec.enable_attn_logit_softcapping:
             padding_mask = '0'
             custom_mask = '0'
 
-    return padding_mask, causal_mask, sliding_window_causal_mask, custom_mask
+    return padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask
 
 
 def get_kernel_code(kspec, kname, lname):
@@ -2014,8 +2020,8 @@ def get_kernel_code(kspec, kname, lname):
     launcher_name = lname
     causal_kernel_name = kname.replace('__placeholder__', '_causal')
     custom_mask_kernel_name = kname.replace('__placeholder__', '_custom_mask')
-    sliding_window_causal_kernel_name = kname.replace('__placeholder__',
-                                                      '_sliding_window_causal')
+    sliding_or_chunked_causal_kernel_name = kname.replace(
+        '__placeholder__', '_sliding_or_chunked_causal')
     kernel_name = kname.replace('__placeholder__', '')
 
     # FIXME: use separate parameters when generating cubins for trtllm.
@@ -2092,14 +2098,16 @@ def get_kernel_code(kspec, kname, lname):
         flags |= 2048
     if kspec.tiled:
         flags |= 4096
+    if kspec.is_mtp:
+        flags |= 8192
 
     # only generate certain needed combinations of input_layout and mask types for trt-llm.
-    padding_mask, causal_mask, sliding_window_causal_mask, custom_mask = \
+    padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = \
         selected_mask_types(kspec)
 
     if any(selected_mask_flag == '1'
            for selected_mask_flag in selected_mask_types(kspec)):
-        padding_mask, causal_mask, sliding_window_causal_mask, custom_mask = \
+        padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = \
             selected_mask_types(kspec)
     else:
         return None
@@ -2752,6 +2760,8 @@ def get_kernel_traits_code(specs_names):
             flags |= 2048
         if kspec.tiled:
             flags |= 4096
+        if kspec.is_mtp:
+            flags |= 8192
 
         kernel_flags = '0x{:02x}u'.format(flags)
 
@@ -2856,11 +2866,11 @@ def get_kernel_traits_code(specs_names):
                 '__placeholder__', '_causal')
             snippet_flash_nl_tiled_causal = snippet_flash_nl_template.replace(
                 '__placeholder__', '_causal').replace('_nl', '_nl_tiled')
-            snippet_flash_nl_sliding_window_causal = snippet_flash_nl_template.replace(
-                '__placeholder__', '_sliding_window_causal')
-            snippet_flash_nl_tiled_sliding_window_causal = snippet_flash_nl_template.replace(
+            snippet_flash_nl_sliding_or_chunked_causal = snippet_flash_nl_template.replace(
+                '__placeholder__', '_sliding_or_chunked_causal')
+            snippet_flash_nl_tiled_sliding_or_chunked_causal = snippet_flash_nl_template.replace(
                 '__placeholder__',
-                '_sliding_window_causal').replace('_nl', '_nl_tiled')
+                '_sliding_or_chunked_causal').replace('_nl', '_nl_tiled')
             snippet_flash_nl_custom_mask = snippet_flash_nl_template.replace(
                 '__placeholder__', '_custom_mask')
             snippet_flash_nl_tiled_custom_mask = snippet_flash_nl_template.replace(
@@ -2874,6 +2884,7 @@ def get_kernel_traits_code(specs_names):
                                   {loop_step},
                                   {kv_loop_step},
                                   {head_size},
+                                  {head_size_v},
                                   {q_tile_buffers},
                                   {kv_tile_buffers},
                                   NUM_COMPUTE_GROUPS,
@@ -2902,8 +2913,8 @@ def get_kernel_traits_code(specs_names):
             snippet_ws_causal = snippet_ws_template.replace('__placeholder__', '_causal').\
                                                           replace('mask_type', '1').\
                                                           replace('__use_tma_store__', 'true')
-            snippet_ws_sliding_window_causal = \
-                snippet_ws_template.replace('__placeholder__', '_sliding_window_causal').\
+            snippet_ws_sliding_or_chunked_causal = \
+                snippet_ws_template.replace('__placeholder__', '_sliding_or_chunked_causal').\
                                        replace('mask_type', '2').\
                                        replace('__use_tma_store__', 'false')
             snippet_ws_custom_mask = \
@@ -2956,22 +2967,22 @@ def get_kernel_traits_code(specs_names):
                 {unroll_threshold});
         }}'''.format(**tmp)
             snippet = snippet_template.replace('__placeholder__', '')
-            snippet_causal = snippet_template.replace('__placeholder__',
-                                                      '_sliding_window_causal')
-            snippet_sliding_window_causal = snippet_template.replace(
+            snippet_causal = snippet_template.replace(
+                '__placeholder__', '_sliding_or_chunked_causal')
+            snippet_sliding_or_chunked_causal = snippet_template.replace(
                 '__placeholder__', '_causal')
             snippet_nl = snippet_nl_template.replace('__placeholder__', '')
             snippet_nl_causal = snippet_nl_template.replace(
                 '__placeholder__', '_causal')
-            snippet_nl_sliding_window_causal = snippet_nl_template.replace(
-                '__placeholder__', '_sliding_window_causal')
+            snippet_nl_sliding_or_chunked_causal = snippet_nl_template.replace(
+                '__placeholder__', '_sliding_or_chunked_causal')
 
         # only generate certain needed combinations of input_layout and mask types for trt-llm.
         selected_types = selected_mask_types(kspec)
 
         padding_mask = int(selected_types[0])
         causal_mask = int(selected_types[1])
-        sliding_window_causal_mask = int(selected_types[2])
+        sliding_or_chunked_causal_mask = int(selected_types[2])
         custom_mask = int(selected_types[3])
 
         if not padding_mask:
@@ -2986,12 +2997,12 @@ def get_kernel_traits_code(specs_names):
             snippet_ws_causal = None
             snippet_flash_nl_causal = None
             snippet_flash_nl_tiled_causal = None
-        if not sliding_window_causal_mask:
-            snippet_sliding_window_causal = None
-            snippet_nl_sliding_window_causal = None
-            snippet_ws_sliding_window_causal = None
-            snippet_flash_nl_sliding_window_causal = None
-            snippet_flash_nl_tiled_sliding_window_causal = None
+        if not sliding_or_chunked_causal_mask:
+            snippet_sliding_or_chunked_causal = None
+            snippet_nl_sliding_or_chunked_causal = None
+            snippet_ws_sliding_or_chunked_causal = None
+            snippet_flash_nl_sliding_or_chunked_causal = None
+            snippet_flash_nl_tiled_sliding_or_chunked_causal = None
         if not custom_mask:
             snippet_ws_custom_mask = None
             snippet_flash_nl_custom_mask = None
@@ -3004,32 +3015,33 @@ def get_kernel_traits_code(specs_names):
             print_kernel_specs.append(snippet)
             if 'snippet_causal' in locals():
                 print_kernel_specs.append(snippet_causal)
-            if 'snippet_sliding_window_causal' in locals():
-                print_kernel_specs.append(snippet_sliding_window_causal)
+            if 'snippet_sliding_or_chunked_causal' in locals():
+                print_kernel_specs.append(snippet_sliding_or_chunked_causal)
         if kspec.has_noloop:
             if kspec.flash_attention and kspec.tiled == 1:
                 print_kernel_specs.append(snippet_flash_nl_tiled)
                 print_kernel_specs.append(snippet_flash_nl_tiled_causal)
                 print_kernel_specs.append(
-                    snippet_flash_nl_tiled_sliding_window_causal)
+                    snippet_flash_nl_tiled_sliding_or_chunked_causal)
                 print_kernel_specs.append(snippet_flash_nl_tiled_custom_mask)
             elif kspec.flash_attention and kspec.tiled == 0:
                 print_kernel_specs.append(snippet_flash_nl)
                 print_kernel_specs.append(snippet_flash_nl_causal)
                 print_kernel_specs.append(
-                    snippet_flash_nl_sliding_window_causal)
+                    snippet_flash_nl_sliding_or_chunked_causal)
                 print_kernel_specs.append(snippet_flash_nl_custom_mask)
             else:
                 print_kernel_specs.append(snippet_nl)
                 if 'snippet_nl_causal' in locals():
                     print_kernel_specs.append(snippet_nl_causal)
-                if 'snippet_nl_sliding_window_causal' in locals():
-                    print_kernel_specs.append(snippet_nl_sliding_window_causal)
+                if 'snippet_nl_sliding_or_chunked_causal' in locals():
+                    print_kernel_specs.append(
+                        snippet_nl_sliding_or_chunked_causal)
 
         if kspec.warp_specialization:
             print_kernel_specs.append(snippet_ws)
             print_kernel_specs.append(snippet_ws_causal)
-            print_kernel_specs.append(snippet_ws_sliding_window_causal)
+            print_kernel_specs.append(snippet_ws_sliding_or_chunked_causal)
             print_kernel_specs.append(snippet_ws_custom_mask)
     # remove none.
     print_kernel_specs = [
@@ -3075,7 +3087,7 @@ def get_cubin_header(kernel_traits, specs_names):
                 'tma_',
                 '').replace('ldgsts_', '').replace('causal_', '').replace(
                     'alibi_', '').replace('softmax_', '').replace(
-                        'sliding_window_',
+                        'sliding_or_chunked_',
                         '').replace('custom_mask_', '').replace(
                             'qkv_', '').replace('q_kv_', '').replace(
                                 'q_paged_kv_', '').replace('ws_', '').replace(
@@ -3149,11 +3161,11 @@ def get_cubin_header(kernel_traits, specs_names):
         is_tiled = pythonBoolean2cpp['_tiled' in kname]
 
         # Attention mask type:
-        # padding (0), causal_mask (1), sliding_window_causal_mask (2), custom_mask (3).
+        # padding (0), causal_mask (1), sliding_or_chunked_causal_mask (2), custom_mask (3).
         if '_custom_mask' in kname:
             attention_mask_type = AttentionMaskType.CUSTOM_MASK
-        elif '_sliding_window_causal' in kname:
-            attention_mask_type = AttentionMaskType.SLIDING_WINDOW_CAUSAL
+        elif '_sliding_or_chunked_causal' in kname:
+            attention_mask_type = AttentionMaskType.SLIDING_OR_CHUNKED_CAUSAL
         elif '_causal' in kname:
             attention_mask_type = AttentionMaskType.CAUSAL
 
@@ -3205,7 +3217,7 @@ def get_cubin_header(kernel_traits, specs_names):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
-                        '_sliding_window_causal', '_custom_mask', '_causal'
+                        '_sliding_or_chunked_causal', '_custom_mask', '_causal'
                     ]
                     for mask_type in mask_types:
                         lname = lname.replace(mask_type, '')
@@ -3218,6 +3230,12 @@ def get_cubin_header(kernel_traits, specs_names):
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
+{attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
+'''.format(**locals()) if 'sage' in kname and 'sm90' in kname else '''\
+{{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
+{sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
+0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
 '''.format(**locals())
@@ -3324,7 +3342,6 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
 {metadata_v2}
 }};
 {local_ns_close}
-
 '''.format(**locals(), copyright=copyright)
 
     else:
@@ -3532,7 +3549,10 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype='fp16'):
 
 
 # Note this will be used in TRT-LLM.
-def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
+def enumerate_hgmma_flash_warpspec_kernels(specs,
+                                           sm=90,
+                                           dtype='fp16',
+                                           head_size_v=0):
 
     scheduling_mode = int(os.getenv('SCHEDULING_MODE', '1'))
 
@@ -3555,6 +3575,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
                 dtype=dtype,
                 seq_len=0,  # support any sequence length
                 head_size=[32, 40, 48, 64],
+                head_size_v=head_size_v,
                 warps_m=4,  #4x1 warpgroups
                 warps_n=1,
                 version=2,
@@ -3587,6 +3608,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
                 dtype=dtype,
                 seq_len=0,  # support any sequence length
                 head_size=[72, 80, 96, 104, 128],
+                head_size_v=head_size_v,
                 warps_m=4,  #4x1 warpgroups
                 warps_n=1,
                 version=2,
@@ -3619,6 +3641,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
                 dtype=dtype,
                 seq_len=0,  # support any sequence length
                 head_size=[160, 192, 256],
+                head_size_v=head_size_v,
                 warps_m=4,  #4x1 warpgroups
                 warps_n=1,
                 version=2,
@@ -3633,6 +3656,40 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
                 has_noloop=0,
                 noloop_step=64,
                 kv_loop_step=64,
+                kv_tile_buffers=2,  # only used by warp specialized kernels
+                unroll_threshold=1,
+                has_scale_max=False,
+                flash_attention=True,
+                warp_specialization=True,
+                alibi=alibi,
+                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                return_softmax_stats=return_softmax,
+                scheduling_mode=scheduling_mode,
+                input_layout=input_layout))
+
+        # for deepseek context 192/128, kv_step=128
+        specs.append(
+            kernel_spec(
+                sm=sm,
+                sm_mma=90,
+                dtype=dtype,
+                seq_len=0,  # support any sequence length
+                head_size=192,
+                head_size_v=128,
+                warps_m=4,  #4x1 warpgroups
+                warps_n=1,
+                version=2,
+                interleaved=False,
+                ldgsts_q=
+                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                ldgsts_k=False,
+                ldgsts_v=False,
+                share_smem_k_v=False,
+                loop_step=64,
+                q_tile_buffers=1,  # only used by warp specialized kernels
+                has_noloop=0,
+                noloop_step=64,
+                kv_loop_step=128,
                 kv_tile_buffers=2,  # only used by warp specialized kernels
                 unroll_threshold=1,
                 has_scale_max=False,
@@ -4629,8 +4686,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     has_scale_max=False,
                     ctas_per_head=1,
                     input_layout=input_layout,
-                    enable_attn_logit_softcapping=enable_attn_logit_softcapping)
-            )
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    is_mtp=(head_size == 576 and head_size_v == 512)))
 
     for head_size in [
             16, 32, 40, 48, 64, 72, 80, 96, 104, 128, 160, 192, 256, 512
@@ -4966,7 +5023,8 @@ def enumerate_qmma_flash_kernels(specs,
                         ctas_per_head=1,
                         input_layout=input_layout,
                         sage_block_sizes=sage_block_sizes,
-                        output_dtype=output_dtype))
+                        output_dtype=output_dtype,
+                        is_mtp=(head_size == 576 and head_size_v == 512)))
 
 
 def enumerate_imma_kernels(specs, sm=80):
@@ -6126,10 +6184,12 @@ def enumerate_kernels():
             enumerate_hmma_flash_kernels(specs, sm=120, dtype='fp16_fp32')
 
     for sm in [80, 86, 89, 90]:
-        enumerate_hmma_flash_kernels(specs,
-                                     sm=sm,
-                                     dtype='bf16',
-                                     head_size_v=128)
+        if not (sm == 90 and "GENERATE_CUBIN" in os.environ):
+            # Hopper uses warp-specialized kernels instead (hasn't been merged yet).
+            enumerate_hmma_flash_kernels(specs,
+                                         sm=sm,
+                                         dtype='bf16',
+                                         head_size_v=128)
         enumerate_hmma_flash_kernels(specs,
                                      sm=sm,
                                      dtype='bf16',
@@ -6204,7 +6264,21 @@ def enumerate_kernels():
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.warp_specialization == False
-                  and kspec.tiled == True)
+                  and kspec.tiled == True
+                  and not (kspec.sm == 90 and (kspec.head_size, kspec.head_size_v) == (192, 128)))
+                  # Deepseek MLA (hopper-style context 192/128 packed + paged)
+                  or (kspec.sm            == 90
+                  and kspec.dtype         == 'bf16'
+                  and kspec.head_size     == 192
+                  and kspec.head_size_v   == 128
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == True
+                  and kspec.warp_specialization == True
+                  and kspec.input_layout in [InputLayout.PACKED_QKV, InputLayout.Q_PAGED_KV]
+                  and kspec.alibi == False
+                  and kspec.enable_attn_logit_softcapping == False)
                   # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
                   or (kspec.sm            == 90
                   and kspec.head_size     in [80, 128]
