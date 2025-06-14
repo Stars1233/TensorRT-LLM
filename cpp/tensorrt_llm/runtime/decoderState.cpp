@@ -365,28 +365,24 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
             ITensor::makeShape({mMaxBatchSize * speculativeDecodingModule->getMaxDraftPathLen()}));
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
+    if (speculativeDecodingMode.isExplicitDraftTokens())
+    {
+        mJointDecodingOutput->explicitDraftTokensBuffers = runtime::ExplicitDraftTokensBuffers::Inputs();
+        mJointDecodingOutput->explicitDraftTokensBuffers->create(
+            mMaxBatchSize, bufferManager, modelConfig, worldConfig);
+    }
+    else if (speculativeDecodingMode.isEagle())
+    {
+        mJointDecodingOutput->eagleBuffers = runtime::EagleBuffers::Inputs();
+        mJointDecodingOutput->eagleBuffers->create(mMaxBatchSize, bufferManager, modelConfig, worldConfig);
+    }
+    else if (speculativeDecodingMode.isLookaheadDecoding())
+    {
+        mJointDecodingOutput->lookaheadOutputs
+            = runtime::LookaheadDecodingBuffers(mMaxBatchSize, mMaxDecodingEngineTokens, bufferManager);
+        mJointDecodingInput->lookaheadInputs->tokensPerStep = mJointDecodingOutput->lookaheadOutputs->generationLengths;
+    }
 
-void DecoderState::setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    mJointDecodingOutput->explicitDraftTokensBuffers = std::move(explicitDraftTokensBuffers);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void DecoderState::setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    mJointDecodingOutput->lookaheadOutputs = std::move(lookaheadDecodingBuffers);
-    mJointDecodingInput->lookaheadInputs->tokensPerStep = mJointDecodingOutput->lookaheadOutputs->generationLengths;
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void DecoderState::setupEagle(EagleBuffers::Inputs eagleBuffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    mJointDecodingOutput->eagleBuffers = std::move(eagleBuffers);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -417,80 +413,67 @@ void DecoderState::disableLookahead(RequestVector const& genRequests)
 
 TensorPtr DecoderState::getFinishedSum() const
 {
-    return ITensor::slice(mJointDecodingOutput->finishedSum, 0, mMaxBatchSize);
+    return mJointDecodingOutput->finishedSum;
 }
 
 TensorPtr DecoderState::getFinishReasons() const
 {
-    return ITensor::slice(mJointDecodingOutput->finishReasons, 0, mMaxBatchSize);
+    return mJointDecodingOutput->finishReasons;
 }
 
 TensorPtr DecoderState::getIds() const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mJointDecodingOutput->ids, 0, mMaxBatchSize);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return tensor;
+    return mJointDecodingOutput->ids;
 }
 
 TensorPtr DecoderState::getIds(SizeType32 batchIdx) const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mJointDecodingOutput->ids, batchIdx, 1);
-    tensor->squeeze(0);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return tensor;
+    return ITensor::at(mJointDecodingOutput->ids, {batchIdx});
 }
 
 TensorPtr DecoderState::getGatheredIds() const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, 0, mMaxBatchSize);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return tensor;
+    return mJointDecodingOutput->gatheredIds;
 }
 
 TensorPtr DecoderState::getGatheredIds(SizeType32 batchIdx) const
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, batchIdx, 1);
-    tensor->squeeze(0);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return tensor;
+    return ITensor::at(mJointDecodingOutput->gatheredIds, {batchIdx});
 }
 
 TensorPtr DecoderState::getParentIds() const
 {
-    return ITensor::slice(mJointDecodingOutput->parentIds, 0, mMaxBatchSize);
+    return mJointDecodingOutput->parentIds;
 }
 
 TensorPtr DecoderState::getCumLogProbs() const
 {
-    return ITensor::slice(mJointDecodingOutput->cumLogProbs, 0, mMaxBatchSize);
+    return mJointDecodingOutput->cumLogProbs;
 }
 
 TensorPtr DecoderState::getCumLogProbs(SizeType32 batchIdx) const
 {
-    auto tensor = ITensor::slice(mJointDecodingOutput->cumLogProbs, batchIdx, 1);
-    tensor->squeeze(0);
-    return tensor;
+    return ITensor::at(mJointDecodingOutput->cumLogProbs, {batchIdx});
 }
 
 TensorPtr DecoderState::getLogProbs() const
 {
-    return ITensor::slice(mJointDecodingOutput->logProbs, 0, mMaxBatchSize);
+    return mJointDecodingOutput->logProbs;
 }
 
 TensorPtr DecoderState::getLogProbs(SizeType32 batchIdx) const
 {
-    auto tensor = ITensor::slice(mJointDecodingOutput->logProbs, batchIdx, 1);
-    tensor->squeeze(0);
-    return tensor;
+    return ITensor::at(mJointDecodingOutput->logProbs, {batchIdx});
 }
 
 TensorPtr DecoderState::getSequenceLengths() const
 {
     return mJointDecodingOutput->lengths;
+}
+
+TensorPtr DecoderState::getSequenceLengths(SizeType32 batchIdx) const
+{
+    return ITensor::at(mJointDecodingOutput->lengths, {batchIdx});
 }
 
 TensorPtr DecoderState::getAllNewTokens() const
@@ -528,6 +511,11 @@ TensorPtr DecoderState::getFinishedSteps() const
     return mFinishedSteps;
 }
 
+SizeType32 DecoderState::getMaxBatchSize() const
+{
+    return mMaxBatchSize;
+}
+
 SizeType32 DecoderState::getMaxBeamWidth() const
 {
     return mMaxBeamWidth;
@@ -551,6 +539,21 @@ SizeType32 DecoderState::getMaxDecodingEngineTokens() const
 SpeculativeDecodingMode DecoderState::getSpeculativeDecodingMode() const
 {
     return mSpeculativeDecodingMode;
+}
+
+ExplicitDraftTokensBuffers::Inputs const& DecoderState::getExplicitDraftTokensBuffers() const
+{
+    return *mJointDecodingOutput->explicitDraftTokensBuffers;
+}
+
+EagleBuffers::Inputs const& DecoderState::getEagleBuffers() const
+{
+    return *mJointDecodingOutput->eagleBuffers;
+}
+
+LookaheadDecodingBuffers const& DecoderState::getLookaheadBuffers() const
+{
+    return *mJointDecodingOutput->lookaheadOutputs;
 }
 
 std::vector<SizeType32> const& DecoderState::getNumDecodingEngineTokens() const

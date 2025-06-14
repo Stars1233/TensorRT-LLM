@@ -76,7 +76,7 @@ struct DMA
     // The tile size of V.
     enum
     {
-        TILE_SIZE_V = TILE_SIZE_K
+        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
     };
 
     // The tile size of V after head_dimension split.
@@ -97,16 +97,16 @@ struct DMA
         USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
     };
 
-    // Whether do we skip those masked tiles when causal mask is enabled ?
+    // Whether we skip those masked tiles when causal mask is enabled ?
     enum
     {
         SKIP_CAUSAL_MASK_TILES = CAUSAL_MASK && !USE_CUSTOM_MASK
     };
 
-    // Whether we will ignore the long distance tokens in the beginning.
+    // Whether we attend to the specific sliding window or chunk ?
     enum
     {
-        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
+        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
     // Is heads interleaved ?
@@ -161,7 +161,7 @@ struct DMA
 
     static_assert(STEP_KV % K_ == 0);
     using Transposer = Transposer<typename Kernel_traits::Traits_o, typename Kernel_traits::Cta_tile_o, K_,
-        (STEP_KV > 128 || SLIDING_WINDOW_ATTENTION) ? 1 : 2 /* UNROLL */>;
+        (STEP_KV > 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
 
     struct Device
     {
@@ -179,6 +179,39 @@ struct DMA
         inline __device__ Device(uint32_t elect_one)
             : elect_one_(elect_one)
         {
+        }
+
+        ////////////////////////////////////////////////////////////////////////////////////////////
+
+        // Compute the kv tile idx start (inclusive) and end (exclusive).
+        static inline __device__ std::pair<int, int> compute_kv_tile_idx(
+            bert::Fused_multihead_attention_params_v2 const& params, int q_step_offset, int q_step_end, int kv_steps)
+        {
+
+            // The default kv_idx_start and kv_idx_end (exclusive).
+            int kv_idx_start = 0;
+            int kv_idx_end = kv_steps;
+
+            // Is the chunked_attention used ?
+            bool is_chunked_attention = params.log2_chunked_attention_size > 0;
+
+            // Skip initial kv tiles due to sliding_window_size
+            if (SLIDING_OR_CHUNKED_ATTENTION)
+            {
+                // The kv_offset_start.
+                int kv_offset_start = is_chunked_attention
+                    ? ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
+                    : max(0, q_step_offset - params.sliding_window_size);
+                kv_idx_start = kv_offset_start / STEP_KV;
+            }
+
+            // Early stop when causal mask is enabled.
+            if (SKIP_CAUSAL_MASK_TILES)
+            {
+                kv_idx_end = (q_step_end + STEP_KV - 1) / STEP_KV;
+            }
+
+            return std::make_pair(kv_idx_start, kv_idx_end);
         }
 
         ////////////////////////////////////////////////////////////////////////////////////////////
@@ -226,7 +259,7 @@ struct DMA
                 else
                 {
                     // Balanced dynamic scheduling
-                    if (CAUSAL_MASK && !SLIDING_WINDOW_ATTENTION && params.use_balanced_scheduling)
+                    if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling)
                     {
                         q_step_offset
                             = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) * NUM_COMPUTE_GROUPS;
@@ -247,6 +280,7 @@ struct DMA
 
                 cudaTmaDesc const* desc_q = &params.tma_desc_q;
                 cudaTmaDesc const* desc_kv = &params.tma_desc_kv;
+                cudaTmaDesc const* desc_v = &params.tma_desc_v;
                 int actual_seqlen;
                 if (params.is_s_padded)
                 {
@@ -299,21 +333,18 @@ struct DMA
                     load_q(bidh, q_step_idx + 0 + q_step_offset, desc_q, shared->smem_q[0], cbw0);
                     load_q(bidh, q_step_idx + 1 + q_step_offset, desc_q, shared->smem_q[1], cbw1);
 
-                    // Skip initial kv tiles due to sliding_window_size
-                    int const kv_idx_start = SLIDING_WINDOW_ATTENTION
-                        ? (max(0, (q_step_idx + q_step_offset) * STEP_Q - params.sliding_window_size) / STEP_KV)
-                        : 0;
-
                     // Q step bound is 2 tiles away at this moment because of 2x1 math warpgroup
-                    int const q_step_bound = (q_step_idx + q_step_offset + 2) * STEP_Q - 1;
+                    int const q_step_end = (q_step_idx + q_step_offset + 2) * STEP_Q - 1;
 
-                    // Early stop when causal mask is enabled.
-                    int const kv_idx_end = SKIP_CAUSAL_MASK_TILES ? ((q_step_bound + STEP_KV - 1) / STEP_KV) : kv_steps;
+                    // The kv tile idx range for this q step.
+                    auto const [kv_idx_start, kv_idx_end]
+                        = compute_kv_tile_idx(params, (q_step_idx + q_step_offset) * STEP_Q, q_step_end, kv_steps);
 
+                    // Iterate over the kv tiles for this q step.
                     for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++)
                     {
-                        int bar_id = load_kv(bidh, params.h, params.h_kv, kv_step_idx, desc_kv, shared, cbw_k, cbw_v,
-                            cbw_v_scratch, cbr_v_scratch);
+                        int bar_id = load_kv(bidh, params.h, params.h_kv, kv_step_idx, desc_kv, desc_v, shared, cbw_k,
+                            cbw_v, cbw_v_scratch, cbr_v_scratch);
 
                         // Opportunistically hide headinfo in the shadow of UTMALDGs of the QKV tensor
                         if (q_step_idx == 0 && kv_step_idx == kv_idx_start)
@@ -372,7 +403,7 @@ struct DMA
             // This will be removed later as the remapping will be handled by the kvCacheManger in TRTLLM.
 #ifdef GENERATE_CUBIN
             // Sliding window attention + chunked context needs special handling.
-            if constexpr (SLIDING_WINDOW_ATTENTION)
+            if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
             {
                 // For chunked context (i.e. separate q and kv layout), the kv cache might be
                 // overwritten after last chunk is processed.
@@ -481,7 +512,17 @@ struct DMA
                 int32_t const* paged_block_offsets
                     = params.paged_kv_cache.mBlockOffsets + bidb * 2 * params.paged_kv_cache.mMaxBlocksPerSeq;
                 cudaTmaDesc const* desc_kv = &params.tma_desc_kv;
-
+                // If a separate v_stride_in_bytes is set, we have to use separate tma_desc_v,
+                // otherwise share with tma_desc_kv.
+                // This is for the compatibility that TensorRT-LLM needs no modification if padding V to 192.
+#ifndef GENERATE_CUBIN
+                cudaTmaDesc const* desc_v
+                    = (params.v_stride_in_bytes == 0 || params.v_stride_in_bytes == params.kv_stride_in_bytes)
+                    ? desc_kv
+                    : &params.tma_desc_v;
+#else
+                cudaTmaDesc const* desc_v = desc_kv;
+#endif
                 if (SCHEDULING_MODE == 0)
                 {
                     // split work across M
@@ -523,17 +564,14 @@ struct DMA
                     load_separate_q(
                         bidh, (q_step_idx + 1) * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[1], cbw1);
 
-                    // Skip initial kv tiles due to sliding_window_size
-                    int const kv_idx_start = SLIDING_WINDOW_ATTENTION
-                        ? (max(0, q_step_idx * STEP_Q + q_tile_offset - params.sliding_window_size) / STEP_KV)
-                        : 0;
+                    // Q step end is 2 tiles away at this moment because of 2x1 math warpgroup
+                    int const q_step_end = (q_step_idx + 2) * STEP_Q - 1 + q_tile_offset;
 
-                    // Q step bound is 2 tiles away at this moment because of 2x1 math warpgroup
-                    int const q_step_bound = (q_step_idx + 2) * STEP_Q - 1 + q_tile_offset;
+                    // The kv tile idx range for this q step.
+                    auto const [kv_idx_start, kv_idx_end]
+                        = compute_kv_tile_idx(params, q_step_idx * STEP_Q + q_tile_offset, q_step_end, kv_steps);
 
-                    // Early stop when causal mask is enabled.
-                    int const kv_idx_end = SKIP_CAUSAL_MASK_TILES ? ((q_step_bound + STEP_KV - 1) / STEP_KV) : kv_steps;
-
+                    // Iterate over the kv tiles for this q step.
                     for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++)
                     {
                         // Remap the kv tile idx if sliding window attention is enabled.
@@ -548,7 +586,8 @@ struct DMA
                             bar_id = load_paged_kv(bidh_kv, remapped_kv_step_idx * STEP_KV, num_valid_kv_blocks,
                                 params.paged_kv_cache.mTokensPerBlockLog2, params.blocks_per_tma_load,
                                 params.blocks_per_tma_load_log2, params.paged_kv_cache.mMaxBlocksPerSeq,
-                                paged_block_offsets, desc_kv, shared, cbw_k, cbw_v, cbw_v_scratch, cbr_v_scratch);
+                                paged_block_offsets, desc_kv, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch,
+                                cbr_v_scratch);
                         }
                         else
                         {
@@ -643,7 +682,7 @@ struct DMA
         // Load k,v tiles from gmem to smem by TMA.
         template <typename BufferWriter>
         inline __device__ void load_kv_impl(int bidh, int h, int h_kv, int kv_step_idx, cudaTmaDesc const* desc_kv,
-            Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v)
+            cudaTmaDesc const* desc_v, Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v)
         {
 
             int k_barrier_id = cbw_k.tmaReserve(elect_one_, (TILE_SIZE_K) *Kernel_traits::ELEMENT_BYTES);
@@ -658,8 +697,6 @@ struct DMA
             // split D into multiple groups in order to satisfy the TMA 128B sizzle mode
             int32_t const k_coord_dim1 = HEADS_INTERLEAVED ? 1 : bidh;
             int32_t const k_coord_dim2 = HEADS_INTERLEAVED ? bidh : 1;
-            int32_t const v_coord_dim1 = HEADS_INTERLEAVED ? 2 : bidh;
-            int32_t const v_coord_dim2 = HEADS_INTERLEAVED ? bidh : 2;
 
 #pragma unroll
             for (int di = 0; di < Kernel_traits::D_GROUPS; ++di)
@@ -672,12 +709,14 @@ struct DMA
                     __cvta_generic_to_shared(
                         &shared->smem_k[k_barrier_id * TILE_SIZE_K + di * TILE_SIZE_K_PER_D_GROUP]),
                     __cvta_generic_to_shared(cbw_k.barrier_ptr(k_barrier_id)), k_coords, elect_one_);
-
+            }
+#pragma unroll
+            for (int di = 0; di < Kernel_traits::DV_GROUPS; ++di)
+            {
                 int32_t const v_coords[4] = {di * Kernel_traits::D_PER_GROUP,
-                    multi_query_attention_ ? h + h_kv + bidh / (h / h_kv) : v_coord_dim1,
-                    multi_query_attention_ ? 0 : v_coord_dim2, sum_s_q_ + kv_step_idx * STEP_KV};
+                    multi_query_attention_ ? bidh / (h / h_kv) : bidh, 0, sum_s_q_ + kv_step_idx * STEP_KV};
 
-                fmha::utmaldg<4, fmha::cudaTmaDescType::TILED, false>(desc_kv,
+                fmha::utmaldg<4, fmha::cudaTmaDescType::TILED, false>(desc_v,
                     __cvta_generic_to_shared(
                         &shared->smem_v[v_barrier_id * TILE_SIZE_V + di * TILE_SIZE_V_PER_D_GROUP]),
                     __cvta_generic_to_shared(cbw_v.barrier_ptr(v_barrier_id)), v_coords, elect_one_);
@@ -721,8 +760,8 @@ struct DMA
         template <typename BufferWriter>
         inline __device__ void load_paged_kv_impl(int bidh, int kv_tile_start_offset, int num_valid_kv_blocks,
             int tokens_per_block_log2, int blocks_per_tma_load, int blocks_per_tma_load_log2,
-            int max_blocks_per_sequence, int32_t const* paged_block_offsets, cudaTmaDesc const* desc_kv, Shared* shared,
-            BufferWriter& cbw_k, BufferWriter& cbw_v)
+            int max_blocks_per_sequence, int32_t const* paged_block_offsets, cudaTmaDesc const* desc_kv,
+            cudaTmaDesc const* desc_v, Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v)
         {
 
             int k_barrier_id = cbw_k.tmaReserve(elect_one_, (TILE_SIZE_K) *Kernel_traits::ELEMENT_BYTES);
@@ -756,11 +795,14 @@ struct DMA
                         __cvta_generic_to_shared(&shared->smem_k[k_barrier_id * TILE_SIZE_K
                             + di * TILE_SIZE_K_PER_D_GROUP + bi * tile_size_k_per_block]),
                         __cvta_generic_to_shared(cbw_k.barrier_ptr(k_barrier_id)), k_coords, elect_one_);
-
+                }
+#pragma unroll
+                for (int di = 0; di < Kernel_traits::DV_GROUPS; ++di)
+                {
                     int32_t const v_coords[4]
                         = {di * Kernel_traits::D_PER_GROUP, kv_offset_in_block, bidh, v_paged_block_offset};
 
-                    fmha::utmaldg<4, fmha::cudaTmaDescType::TILED, false>(desc_kv,
+                    fmha::utmaldg<4, fmha::cudaTmaDescType::TILED, false>(desc_v,
                         __cvta_generic_to_shared(&shared->smem_v[v_barrier_id * TILE_SIZE_V
                             + di * TILE_SIZE_V_PER_D_GROUP + bi * tile_size_k_per_block]),
                         __cvta_generic_to_shared(cbw_v.barrier_ptr(v_barrier_id)), v_coords, elect_one_);
@@ -850,8 +892,8 @@ struct DMA
         // Load k,v tiles from gmem to smem by TMA.
         template <typename BufferWriter, typename BufferWriterScratch, typename BufferReaderScratch>
         inline __device__ int load_kv_transpose_v_impl(int bidh, int h, int h_kv, int kv_step_idx,
-            cudaTmaDesc const* desc_kv, Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v,
-            BufferWriterScratch& cbw_v_scratch, BufferReaderScratch& cbr_v_scratch)
+            cudaTmaDesc const* desc_kv, cudaTmaDesc const* desc_v, Shared* shared, BufferWriter& cbw_k,
+            BufferWriter& cbw_v, BufferWriterScratch& cbw_v_scratch, BufferReaderScratch& cbr_v_scratch)
         {
             int k_barrier_id = cbw_k.tmaReserve(elect_one_, (TILE_SIZE_K) *Kernel_traits::ELEMENT_BYTES);
 
@@ -863,8 +905,6 @@ struct DMA
             // split D into multiple groups in order to satisfy the TMA 128B sizzle mode
             int32_t const k_coord_dim1 = HEADS_INTERLEAVED ? 1 : bidh;
             int32_t const k_coord_dim2 = HEADS_INTERLEAVED ? bidh : 1;
-            int32_t const v_coord_dim1 = HEADS_INTERLEAVED ? 2 : bidh;
-            int32_t const v_coord_dim2 = HEADS_INTERLEAVED ? bidh : 2;
 
 #pragma unroll
             for (int di = 0; di < Kernel_traits::D_GROUPS; ++di)
@@ -883,13 +923,12 @@ struct DMA
                 = cbw_v_scratch.tmaReserve(elect_one_, (TILE_SIZE_V) *Kernel_traits::ELEMENT_BYTES);
 
 #pragma unroll
-            for (int di = 0; di < Kernel_traits::D_GROUPS; ++di)
+            for (int di = 0; di < Kernel_traits::DV_GROUPS; ++di)
             {
                 int32_t const v_coords[4] = {di * Kernel_traits::D_PER_GROUP,
-                    multi_query_attention_ ? h + h_kv + bidh / (h / h_kv) : v_coord_dim1,
-                    multi_query_attention_ ? 0 : v_coord_dim2, sum_s_q_ + kv_step_idx * STEP_KV};
+                    multi_query_attention_ ? bidh / (h / h_kv) : bidh, 0, sum_s_q_ + kv_step_idx * STEP_KV};
 
-                fmha::utmaldg<4, fmha::cudaTmaDescType::TILED, false>(desc_kv,
+                fmha::utmaldg<4, fmha::cudaTmaDescType::TILED, false>(desc_v,
                     __cvta_generic_to_shared(
                         &shared->smem_v_scratch[v_scratch_barrier_id * TILE_SIZE_V + di * TILE_SIZE_V_PER_D_GROUP]),
                     __cvta_generic_to_shared(cbw_v_scratch.barrier_ptr(v_scratch_barrier_id)), v_coords, elect_one_);
@@ -1003,19 +1042,19 @@ struct DMA
         // Load k,v tiles from gmem to smem by TMA.
         template <typename BufferWriter, typename BufferWriterScratch, typename BufferReaderScratch>
         inline __device__ int load_kv(int bidh, int h, int h_kv, int kv_step_idx, cudaTmaDesc const* desc_kv,
-            Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v, BufferWriterScratch& cbw_v_scratch,
-            BufferReaderScratch& cbr_v_scratch)
+            cudaTmaDesc const* desc_v, Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v,
+            BufferWriterScratch& cbw_v_scratch, BufferReaderScratch& cbr_v_scratch)
         {
 
             if constexpr (DMA_GROUP_TRANSPOSE_V)
             {
                 int v_scratch_barrier_id = load_kv_transpose_v_impl(
-                    bidh, h, h_kv, kv_step_idx, desc_kv, shared, cbw_k, cbw_v, cbw_v_scratch, cbr_v_scratch);
+                    bidh, h, h_kv, kv_step_idx, desc_kv, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch, cbr_v_scratch);
                 return v_scratch_barrier_id;
             }
             else
             {
-                load_kv_impl(bidh, h, h_kv, kv_step_idx, desc_kv, shared, cbw_k, cbw_v);
+                load_kv_impl(bidh, h, h_kv, kv_step_idx, desc_kv, desc_v, shared, cbw_k, cbw_v);
                 return 0;
             }
         }
@@ -1044,9 +1083,9 @@ struct DMA
         template <typename BufferWriter, typename BufferWriterScratch, typename BufferReaderScratch>
         inline __device__ int load_paged_kv(int bidh, int kv_tile_start_offset, int num_valid_kv_blocks,
             int tokens_per_block_log2, int blocks_per_tma_load, int blocks_per_tma_load_log2,
-            int max_blocks_per_sequence, int32_t const* paged_block_offsets, cudaTmaDesc const* desc_kv, Shared* shared,
-            BufferWriter& cbw_k, BufferWriter& cbw_v, BufferWriterScratch& cbw_v_scratch,
-            BufferReaderScratch& cbr_v_scratch)
+            int max_blocks_per_sequence, int32_t const* paged_block_offsets, cudaTmaDesc const* desc_kv,
+            cudaTmaDesc const* desc_v, Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v,
+            BufferWriterScratch& cbw_v_scratch, BufferReaderScratch& cbr_v_scratch)
         {
 
             if constexpr (DMA_GROUP_TRANSPOSE_V)
@@ -1061,7 +1100,7 @@ struct DMA
             {
                 load_paged_kv_impl(bidh, kv_tile_start_offset, num_valid_kv_blocks, tokens_per_block_log2,
                     blocks_per_tma_load, blocks_per_tma_load_log2, max_blocks_per_sequence, paged_block_offsets,
-                    desc_kv, shared, cbw_k, cbw_v);
+                    desc_kv, desc_v, shared, cbw_k, cbw_v);
                 return 0;
             }
         }
@@ -1114,32 +1153,46 @@ struct DMA
 
                 // Per batch tensor size.
                 uint32_t tensor_size_qkv[4];
+                // Stride size in bytes. Assumes least significant dim is 1 (?)
+                uint64_t tensor_size_qk[3], tensor_size_v[3];
+                uint32_t v_offset;
                 // Total sequence length.
                 int const total_seqlen = params.is_s_padded ? (params.b * params.s) : launch_params.total_q_seqlen;
+                tensor_size_qkv[0] = params.d; // params.d;
                 tensor_size_qkv[3] = total_seqlen;
+                tensor_size_qk[0] = params.d * Kernel_traits::ELEMENT_BYTES;
+                tensor_size_qk[2] = params.qkv_stride_in_bytes;
+                tensor_size_v[1] = 0;
+                tensor_size_v[2] = params.qkv_stride_in_bytes;
                 if (params.h_kv < params.h)
                 {
                     // Take MQA as non-heads-interleaved.
+                    tensor_size_qkv[1] = params.h + params.h_kv;
                     tensor_size_qkv[2] = 1;
-                    tensor_size_qkv[1] = (params.h + 2 * params.h_kv);
-                    tensor_size_qkv[0] = params.d; // params.d;
+                    tensor_size_qk[1] = 0;
+                    tensor_size_v[0] = params.dv * Kernel_traits::ELEMENT_BYTES;
+                    v_offset = (params.h + params.h_kv) * params.d * Kernel_traits::ELEMENT_BYTES;
                 }
                 else if (HEADS_INTERLEAVED)
                 {
+                    tensor_size_qkv[1] = 2;
                     tensor_size_qkv[2] = params.h;
-                    tensor_size_qkv[1] = 3;
-                    tensor_size_qkv[0] = params.d; // params.d;
+                    tensor_size_qk[1] = (2 * params.d + params.dv) * Kernel_traits::ELEMENT_BYTES;
+                    tensor_size_v[0] = tensor_size_qk[1];
+                    v_offset = 2 * params.d * Kernel_traits::ELEMENT_BYTES;
                 }
                 else
                 {
-                    tensor_size_qkv[2] = 3;
                     tensor_size_qkv[1] = params.h;
-                    tensor_size_qkv[0] = params.d; // params.d;
+                    tensor_size_qkv[2] = 2;
+                    tensor_size_qk[1] = params.h * tensor_size_qk[0];
+                    tensor_size_v[0] = params.dv * Kernel_traits::ELEMENT_BYTES;
+                    v_offset = 2 * params.h * params.d * Kernel_traits::ELEMENT_BYTES;
                 }
 
                 // O : [TOTAL, 1, h, d]
                 uint32_t tensor_size_o[4];
-                tensor_size_o[0] = params.d;
+                tensor_size_o[0] = params.dv;
                 tensor_size_o[1] = params.h;
                 tensor_size_o[2] = 1;
                 tensor_size_o[3] = total_seqlen;
@@ -1151,16 +1204,10 @@ struct DMA
                 box_size[1] = 1;
                 box_size[0] = Kernel_traits::D_PER_GROUP;
 
-                // Stride size in bytes. Assumes least significant dim is 1 (?)
-                uint64_t tensor_stride_qkv[3];
-                tensor_stride_qkv[0] = tensor_size_qkv[0] * Kernel_traits::ELEMENT_BYTES; // d
-                tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0];         // d*h
-                tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];         // d*h*3
-
                 uint64_t tensor_stride_o[3];
-                tensor_stride_o[0] = tensor_size_o[0] * Kernel_traits::ELEMENT_BYTES; // d
-                tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];           // d*h
-                tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];           // d*h*1
+                tensor_stride_o[0] = tensor_size_o[0] * Kernel_traits::ELEMENT_BYTES; // dv
+                tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];           // dv*h
+                tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];           // dv*h*1
 
                 // Traversal stride.
                 uint32_t traversal_stride_qkv[4] = {1, 1, 1, 1};
@@ -1198,7 +1245,7 @@ struct DMA
                 box_size[3] = STEP_Q;
                 qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format,
                     fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
+                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_size_qk,
                     traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &params.tma_desc_q);
 
                 // O: 16
@@ -1215,8 +1262,18 @@ struct DMA
                 box_size[3] = STEP_KV;
                 qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format,
                     fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
+                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_size_qk,
                     traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &params.tma_desc_kv);
+
+                // V: STEP_KV.
+                tensor_size_qkv[0] = params.dv;
+                tensor_size_qkv[1] = params.h_kv;
+                tensor_size_qkv[2] = 1;
+
+                qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr + v_offset, desc_format,
+                    fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
+                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_size_v,
+                    traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &params.tma_desc_v);
             }
             else
             {
@@ -1326,7 +1383,16 @@ struct DMA
                     // Paged KV: [UINT32_MAX, H, TokensPerBlock, D]
                     // Per batch tensor size.
                     uint32_t tensor_size_kv[4];
-                    tensor_size_kv[3] = params.b * 2 * params.paged_kv_cache.mMaxBlocksPerSeq;
+                    // The original code is:
+                    // tensor_size_kv[3] = params.b * 2 * params.paged_kv_cache.mMaxBlocksPerSeq;
+                    // If d != dv and v is not padded, then the code should be:
+                    // tensor_size_kv[3] = params.b * params.paged_kv_cache.mMaxBlocksPerSeq
+                    //     * ((params.d + params.dv) / std::gcd(params.d, params.dv));
+                    // TensorRT-LLM uses:
+                    // tensor_size_kv[3] = mLaunchParams.total_device_memory /
+                    // mKernelParams.paged_kv_cache.mBytesPerBlock;
+                    // I think the simplest way is:
+                    tensor_size_kv[3] = INT_MAX;
                     tensor_size_kv[2] = params.h_kv;
                     tensor_size_kv[1] = params.paged_kv_cache.mTokensPerBlock;
                     tensor_size_kv[0] = params.d; // params.d;
@@ -1346,14 +1412,28 @@ struct DMA
                     // Stride size in bytes. Assumes least significant dim is 1 (?)
                     uint64_t tensor_stride_kv[3];
                     tensor_stride_kv[0] = tensor_size_kv[0] * Kernel_traits::ELEMENT_BYTES; // d
-                    tensor_stride_kv[1] = tensor_size_kv[1] * tensor_stride_kv[0];          // d*h
-                    tensor_stride_kv[2] = tensor_size_kv[2] * tensor_stride_kv[1];          // d*h*3
+                    // The original code is:
+                    // tensor_stride_kv[1] = tensor_size_kv[1] * tensor_stride_kv[0];   // d*mTokensPerBlock
+                    // tensor_stride_kv[2] = tensor_size_kv[2] * tensor_stride_kv[1];   // d*mTokensPerBlock*h
+                    // This can be simplified to:
+                    tensor_stride_kv[1] = params.kv_stride_in_bytes;
+                    tensor_stride_kv[2] = params.paged_kv_cache.mBytesPerBlock;
 
                     // Paged KV pool tma descriptors.
                     paged_kv_tma_descriptor.set_tma_desctriptor(reinterpret_cast<char*>(params.paged_kv_cache.mPoolPtr),
                         desc_format, fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
                         fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_kv, tensor_stride_kv,
                         traversal_stride, box_size_kv, oob_fill, fp32_to_tf32, &params.tma_desc_kv);
+#ifndef GENERATE_CUBIN
+                    tensor_size_kv[0] = params.dv;
+                    tensor_stride_kv[0] = tensor_size_kv[0] * Kernel_traits::ELEMENT_BYTES; // dv
+                    tensor_stride_kv[1] = params.v_stride_in_bytes;                         // dv*mTokensPerBlock
+
+                    paged_kv_tma_descriptor.set_tma_desctriptor(reinterpret_cast<char*>(params.paged_kv_cache.mPoolPtr),
+                        desc_format, fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
+                        fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_kv, tensor_stride_kv,
+                        traversal_stride, box_size_kv, oob_fill, fp32_to_tf32, &params.tma_desc_v);
+#endif
                 }
             }
         }
